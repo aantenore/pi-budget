@@ -41,35 +41,46 @@ export function parseOnExceed(raw: unknown): OnExceed {
 
 const FILE_KEYS = ["limits", "warnAt", "onExceed"];
 
-/** Validate the contents of a budget JSON file (or an equivalent object). Throws one error listing every problem. */
-export function validateLayer(input: unknown, source: string): ConfigLayer {
+/**
+ * Outcome of parsing one config source leniently: `layer` holds only the valid keys, `problems`
+ * names every dropped key, and `fatal` is set when the whole source is unusable (unreadable,
+ * invalid JSON, not an object), in which case its contents are unknown.
+ */
+export interface LayerResult {
+  layer: ConfigLayer;
+  problems: string[];
+  fatal?: string;
+}
+
+/** Parse the contents of a budget JSON file (or an equivalent object), dropping invalid keys instead of throwing. */
+export function parseLayer(input: unknown, source: string): LayerResult {
   if (typeof input !== "object" || input === null || Array.isArray(input)) {
-    throw new BudgetConfigError(`${source}: expected a JSON object`);
+    return { layer: {}, problems: [], fatal: `${source}: expected a JSON object` };
   }
   const obj = input as Record<string, unknown>;
-  const errors: string[] = [];
+  const problems: string[] = [];
   const layer: ConfigLayer = {};
 
   for (const key of Object.keys(obj)) {
-    if (!FILE_KEYS.includes(key)) errors.push(`unknown key "${key}" (allowed: ${FILE_KEYS.join(", ")})`);
+    if (!FILE_KEYS.includes(key)) problems.push(`unknown key "${key}" (allowed: ${FILE_KEYS.join(", ")})`);
   }
 
   if (obj.limits !== undefined) {
     const raw = obj.limits;
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
-      errors.push(`"limits" must be an object`);
+      problems.push(`"limits" must be an object`);
     } else {
       const limits: BudgetLimits = {};
       for (const [key, value] of Object.entries(raw)) {
         if (!(LIMIT_KEYS as readonly string[]).includes(key)) {
-          errors.push(`unknown limit "${key}" (allowed: ${LIMIT_KEYS.join(", ")})`);
+          problems.push(`unknown limit "${key}" (allowed: ${LIMIT_KEYS.join(", ")})`);
           continue;
         }
         if (value === undefined || value === null) continue;
         try {
           limits[key as LimitKey] = parseLimitValue(key as LimitKey, value);
         } catch (e) {
-          errors.push((e as Error).message);
+          problems.push((e as Error).message);
         }
       }
       layer.limits = limits;
@@ -79,37 +90,58 @@ export function validateLayer(input: unknown, source: string): ConfigLayer {
     try {
       layer.warnAt = parseWarnAt(obj.warnAt);
     } catch (e) {
-      errors.push((e as Error).message);
+      problems.push((e as Error).message);
     }
   }
   if (obj.onExceed !== undefined) {
     try {
       layer.onExceed = parseOnExceed(obj.onExceed);
     } catch (e) {
-      errors.push((e as Error).message);
+      problems.push((e as Error).message);
     }
   }
-
-  if (errors.length > 0) throw new BudgetConfigError(`invalid config in ${source}: ${errors.join("; ")}`);
-  return layer;
+  return { layer, problems };
 }
 
-/** Read and validate a JSON config file. Returns undefined when the file does not exist. */
-export function readLayerFile(path: string): ConfigLayer | undefined {
+/** Message for a source that had problems, as thrown by the strict validators. */
+function describeProblems(result: LayerResult, label: string): string | undefined {
+  if (result.fatal) return result.fatal;
+  return result.problems.length > 0 ? `${label}: ${result.problems.join("; ")}` : undefined;
+}
+
+/** Validate the contents of a budget JSON file (or an equivalent object). Throws one error listing every problem. */
+export function validateLayer(input: unknown, source: string): ConfigLayer {
+  const result = parseLayer(input, source);
+  const message = describeProblems(result, `invalid config in ${source}`);
+  if (message) throw new BudgetConfigError(message);
+  return result.layer;
+}
+
+/** Read and parse a JSON config file leniently. Returns undefined when the file does not exist. */
+export function parseLayerFile(path: string): LayerResult | undefined {
   let text: string;
   try {
     text = readFileSync(path, "utf8");
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code === "ENOENT") return undefined;
-    throw new BudgetConfigError(`cannot read ${path}: ${(e as Error).message}`);
+    return { layer: {}, problems: [], fatal: `cannot read ${path}: ${(e as Error).message}` };
   }
   let parsed: unknown;
   try {
     parsed = JSON.parse(text);
   } catch (e) {
-    throw new BudgetConfigError(`invalid JSON in ${path}: ${(e as Error).message}`);
+    return { layer: {}, problems: [], fatal: `invalid JSON in ${path}: ${(e as Error).message}` };
   }
-  return validateLayer(parsed, path);
+  return parseLayer(parsed, path);
+}
+
+/** Read and validate a JSON config file. Returns undefined when the file does not exist. */
+export function readLayerFile(path: string): ConfigLayer | undefined {
+  const result = parseLayerFile(path);
+  if (!result) return undefined;
+  const message = describeProblems(result, `invalid config in ${path}`);
+  if (message) throw new BudgetConfigError(message);
+  return result.layer;
 }
 
 /** Environment variable name for each limit that has one. */
@@ -125,7 +157,8 @@ export const ENV_WARN_AT = "PI_BUDGET_WARN_AT";
 
 const present = (value: string | undefined): value is string => value !== undefined && value.trim() !== "";
 
-export function layerFromEnv(env: Record<string, string | undefined>): ConfigLayer {
+/** Parse environment variables, dropping invalid ones instead of throwing. */
+export function parseEnvLayer(env: Record<string, string | undefined>): LayerResult {
   const errors: string[] = [];
   const layer: ConfigLayer = {};
   const limits: BudgetLimits = {};
@@ -153,9 +186,15 @@ export function layerFromEnv(env: Record<string, string | undefined>): ConfigLay
       errors.push(`${ENV_ON_EXCEED}: ${(e as Error).message}`);
     }
   }
-  if (errors.length > 0) throw new BudgetConfigError(`invalid environment: ${errors.join("; ")}`);
   if (Object.keys(limits).length > 0) layer.limits = limits;
-  return layer;
+  return { layer, problems: errors };
+}
+
+export function layerFromEnv(env: Record<string, string | undefined>): ConfigLayer {
+  const result = parseEnvLayer(env);
+  const message = describeProblems(result, "invalid environment");
+  if (message) throw new BudgetConfigError(message);
+  return result.layer;
 }
 
 /** CLI flag values, keyed by limit name (without the `budget-` prefix). */
@@ -170,7 +209,8 @@ export const FLAG_NAMES = {
   onExceed: "budget-on-exceed",
 } as const satisfies Record<keyof FlagValues, string>;
 
-export function layerFromFlags(flags: FlagValues): ConfigLayer {
+/** Parse CLI flag values, dropping invalid ones instead of throwing. */
+export function parseFlagsLayer(flags: FlagValues): LayerResult {
   const errors: string[] = [];
   const layer: ConfigLayer = {};
   const limits: BudgetLimits = {};
@@ -202,9 +242,15 @@ export function layerFromFlags(flags: FlagValues): ConfigLayer {
       errors.push(`--${FLAG_NAMES.onExceed}: ${(e as Error).message}`);
     }
   }
-  if (errors.length > 0) throw new BudgetConfigError(`invalid flags: ${errors.join("; ")}`);
   if (Object.keys(limits).length > 0) layer.limits = limits;
-  return layer;
+  return { layer, problems: errors };
+}
+
+export function layerFromFlags(flags: FlagValues): ConfigLayer {
+  const result = parseFlagsLayer(flags);
+  const message = describeProblems(result, "invalid flags");
+  if (message) throw new BudgetConfigError(message);
+  return result.layer;
 }
 
 /** Merge layers, lowest precedence first, on top of the defaults. */
@@ -234,14 +280,65 @@ export interface LoadConfigOptions {
 }
 
 /**
- * Load the effective configuration. Precedence, lowest to highest:
- * defaults, `~/.pi/budget.json`, `<project>/.pi/budget.json`, environment variables, CLI flags.
+ * Apply the project layer on top of the trusted configuration. The project file lives in the
+ * repository being worked on and may come from someone else, so it can only tighten: it never
+ * raises a limit, never turns `stop` into `warn`, and never delays warnings.
+ */
+export function tightenWithProject(base: BudgetConfig, project: ConfigLayer | undefined): BudgetConfig {
+  if (!project) return base;
+  const config: BudgetConfig = { ...base, limits: { ...base.limits } };
+  for (const [key, value] of Object.entries(project.limits ?? {}) as [LimitKey, number][]) {
+    const current = config.limits[key];
+    config.limits[key] = current === undefined ? value : Math.min(current, value);
+  }
+  if (project.warnAt !== undefined && project.warnAt < config.warnAt) config.warnAt = project.warnAt;
+  if (project.onExceed === "stop") config.onExceed = "stop";
+  return config;
+}
+
+/** Effective configuration plus everything that had to be ignored to build it. */
+export interface ConfigReport {
+  config: BudgetConfig;
+  /** One message per source that had invalid keys; the valid keys of that source still apply. */
+  problems: string[];
+  /** True when a whole source could not be loaded (unreadable file, invalid JSON, not an object). */
+  unusable: boolean;
+}
+
+/**
+ * Load the effective configuration without throwing: every valid key of every source is kept and
+ * invalid keys are dropped and reported. Precedence, lowest to highest: defaults,
+ * `~/.pi/budget.json`, environment variables, CLI flags; then `<project>/.pi/budget.json` may only
+ * tighten the result (see {@link tightenWithProject}).
+ */
+export function loadConfigReport(options: LoadConfigOptions = {}): ConfigReport {
+  const home = options.homeDir ?? homedir();
+  const problems: string[] = [];
+  let unusable = false;
+  const take = (result: LayerResult | undefined, label: string): ConfigLayer | undefined => {
+    if (!result) return undefined;
+    const message = describeProblems(result, label);
+    if (message) problems.push(message);
+    if (result.fatal) unusable = true;
+    return result.layer;
+  };
+
+  const userPath = join(home, ".pi", "budget.json");
+  const user = take(parseLayerFile(userPath), `invalid config in ${userPath}`);
+  const projectPath = options.cwd ? join(options.cwd, ".pi", "budget.json") : undefined;
+  const project = projectPath ? take(parseLayerFile(projectPath), `invalid config in ${projectPath}`) : undefined;
+  const env = take(parseEnvLayer(options.env ?? process.env), "invalid environment");
+  const flags = take(parseFlagsLayer(options.flags ?? {}), "invalid flags");
+
+  return { config: tightenWithProject(mergeLayers(user, env, flags), project), problems, unusable };
+}
+
+/**
+ * Load the effective configuration and throw when any source has a problem. See
+ * {@link loadConfigReport} for the precedence and for a variant that never throws.
  */
 export function loadConfig(options: LoadConfigOptions = {}): BudgetConfig {
-  const home = options.homeDir ?? homedir();
-  const userFile = readLayerFile(join(home, ".pi", "budget.json"));
-  const projectFile = options.cwd ? readLayerFile(join(options.cwd, ".pi", "budget.json")) : undefined;
-  const env = layerFromEnv(options.env ?? process.env);
-  const flags = layerFromFlags(options.flags ?? {});
-  return mergeLayers(userFile, projectFile, env, flags);
+  const report = loadConfigReport(options);
+  if (report.problems.length > 0) throw new BudgetConfigError(report.problems.join("; "));
+  return report.config;
 }

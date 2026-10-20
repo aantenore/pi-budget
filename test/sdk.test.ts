@@ -38,9 +38,15 @@ function setup(hooks: ReturnType<typeof budgetHooks>, responses: Parameters<Faux
     initialState: { systemPrompt: "test", model: faux.getModel(), thinkingLevel: "off", tools: [echo] },
     finishTurn: hooks.finishTurn,
     beforeToolCall: hooks.beforeToolCall,
+    prepareRequest: hooks.prepareRequest,
   });
   agent.subscribe(hooks.observe);
-  return { agent, faux, executed };
+  // Run counters reset when a run ends; record them as each turn is counted (observe runs first).
+  const turnsSeen: number[] = [];
+  agent.subscribe((event: AgentEvent) => {
+    if (event.type === "turn_end") turnsSeen.push(hooks.tracker.used("turns"));
+  });
+  return { agent, faux, executed, turnsSeen };
 }
 
 const call = (text: string) => fauxToolCall("echo", { text });
@@ -48,24 +54,59 @@ const call = (text: string) => fauxToolCall("echo", { text });
 describe("budgetHooks with a real Agent and the faux provider", () => {
   it("ends the run via finishTurn once the token limit is exceeded", async () => {
     const hooks = budgetHooks({ limits: { tokens: 1 } });
-    const { agent, faux, executed } = setup(hooks, [
+    const { agent, faux, executed, turnsSeen } = setup(hooks, [
       fauxAssistantMessage(call("one")),
       fauxAssistantMessage(call("two")),
       fauxAssistantMessage("done"),
     ]);
     await agent.prompt("go");
     expect(faux.state.callCount).toBe(1);
-    expect(executed).toEqual(["one"]); // the tool of the exceeding turn already ran
+    expect(executed).toEqual([]); // usage is ingested at message_end, so even this turn's tool is blocked
     expect(hooks.tracker.isExceeded()).toBe(true);
-    expect(hooks.tracker.used("turns")).toBe(1);
+    expect(turnsSeen).toEqual([1]);
+  });
+
+  it("lets beforeToolCall see the usage of the turn that issued the call", async () => {
+    const hooks = budgetHooks({ limits: { tokens: 1 } });
+    let tokensAtFirstCall = -1;
+    const original = hooks.beforeToolCall;
+    hooks.beforeToolCall = async (ctx, signal) => {
+      if (tokensAtFirstCall < 0) tokensAtFirstCall = hooks.tracker.used("tokens");
+      return original(ctx, signal);
+    };
+    const { agent, executed } = setup(hooks, [fauxAssistantMessage([call("a"), call("b")]), fauxAssistantMessage("done")]);
+    await agent.prompt("go");
+    expect(tokensAtFirstCall).toBeGreaterThan(0);
+    expect(executed).toEqual([]);
+    // Usage arrives once via message_end and is not added again by finishTurn / turn_end.
+    expect(hooks.tracker.used("tokens")).toBe(tokensAtFirstCall);
+  });
+
+  it("makes no provider request when the session budget is already exhausted", async () => {
+    const hooks = budgetHooks({ limits: { usd: 1 } });
+    hooks.tracker.addUsage(usage({ cost: 1.5 }));
+    const { agent, faux } = setup(hooks, [fauxAssistantMessage("should never be requested")]);
+    await agent.prompt("go");
+    expect(faux.state.callCount).toBe(0);
+    const last = agent.state.messages.at(-1) as any;
+    expect(last).toMatchObject({ role: "assistant", stopReason: "error" });
+    expect(last.errorMessage).toMatch(/Budget exceeded \(usd/);
+  });
+
+  it("still sends the request in warn mode when the budget is exhausted", async () => {
+    const hooks = budgetHooks({ limits: { usd: 1 }, onExceed: "warn" });
+    hooks.tracker.addUsage(usage({ cost: 1.5 }));
+    const { agent, faux } = setup(hooks, [fauxAssistantMessage("ok")]);
+    await agent.prompt("go");
+    expect(faux.state.callCount).toBe(1);
   });
 
   it("lets a run finish when it stays under the limits", async () => {
     const hooks = budgetHooks({ limits: { tokens: 1_000_000, turns: 10 } });
-    const { agent, faux } = setup(hooks, [fauxAssistantMessage(call("one")), fauxAssistantMessage("done")]);
+    const { agent, faux, turnsSeen } = setup(hooks, [fauxAssistantMessage(call("one")), fauxAssistantMessage("done")]);
     await agent.prompt("go");
     expect(faux.state.callCount).toBe(2);
-    expect(hooks.tracker.used("turns")).toBe(2);
+    expect(turnsSeen).toEqual([1, 2]);
     expect(hooks.tracker.isExceeded()).toBe(false);
   });
 
@@ -99,13 +140,13 @@ describe("budgetHooks with a real Agent and the faux provider", () => {
 
   it("resets run-scoped counters on each prompt and keeps session usage", async () => {
     const hooks = budgetHooks({ limits: { tokens: 1_000_000, turns: 5 } });
-    const { agent, faux } = setup(hooks, [fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
+    const { agent, faux, turnsSeen } = setup(hooks, [fauxAssistantMessage("one"), fauxAssistantMessage("two")]);
     await agent.prompt("first");
     const tokensAfterFirst = hooks.tracker.used("tokens");
-    expect(hooks.tracker.used("turns")).toBe(1);
+    expect(turnsSeen).toEqual([1]);
     await agent.prompt("second");
     expect(faux.state.callCount).toBe(2);
-    expect(hooks.tracker.used("turns")).toBe(1);
+    expect(turnsSeen).toEqual([1, 1]);
     expect(hooks.tracker.used("tokens")).toBeGreaterThan(tokensAfterFirst);
   });
 });
@@ -133,6 +174,19 @@ describe("budgetHooks with simulated events", () => {
     await hooks.finishTurn(asTurn(t), undefined);
     hooks.observe({ type: "turn_end", message: t.message as any, toolResults: [] });
     expect(hooks.tracker.used("usd")).toBeCloseTo(0.25);
+    expect(hooks.tracker.used("turns")).toBe(1);
+  });
+
+  it("does not count aborted or failed turns, but still counts their usage", () => {
+    const hooks = budgetHooks({ limits: { usd: 10, turns: 10 } });
+    hooks.observe({ type: "agent_start" });
+    for (const stopReason of ["aborted", "error"]) {
+      const message = { ...turnOf(0.25).message, stopReason };
+      hooks.observe({ type: "turn_end", message: message as any, toolResults: [] });
+    }
+    expect(hooks.tracker.used("turns")).toBe(0);
+    expect(hooks.tracker.used("usd")).toBeCloseTo(0.5);
+    hooks.observe({ type: "turn_end", message: { ...turnOf(0).message, stopReason: "stop" } as any, toolResults: [] });
     expect(hooks.tracker.used("turns")).toBe(1);
   });
 

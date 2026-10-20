@@ -26,6 +26,12 @@ export function addUsage(totals: UsageTotals, usage: UsageLike): void {
   totals.cost += num(usage.cost?.total);
 }
 
+/** A turn that ended in an error or an abort did not complete, so it does not count against `turns`. */
+export function countsAsTurn(message: unknown): boolean {
+  const stopReason = (message as { stopReason?: unknown } | null | undefined)?.stopReason;
+  return stopReason !== "aborted" && stopReason !== "error";
+}
+
 const MS_PER_MINUTE = 60_000;
 
 /**
@@ -45,7 +51,6 @@ export class BudgetTracker {
   private turns = 0;
   private toolCalls = 0;
   private runStartedAt: number | undefined;
-  private frozenElapsedMs = 0;
 
   private readonly warned = new Set<LimitKey>();
   private readonly exceededSeen = new Set<LimitKey>();
@@ -96,17 +101,15 @@ export class BudgetTracker {
     }
     this.turns = 0;
     this.toolCalls = 0;
-    this.frozenElapsedMs = 0;
     this.runStartedAt = now;
     return this.evaluate(now);
   }
 
-  /** End the current run, freezing the elapsed time. */
-  endRun(now: number = this.clock()): void {
-    if (this.runStartedAt !== undefined) {
-      this.frozenElapsedMs = Math.max(0, now - this.runStartedAt);
-      this.runStartedAt = undefined;
-    }
+  /** End the current run and reset the run-scoped counters, so an idle tracker never reports run limits as used. */
+  endRun(): void {
+    this.runStartedAt = undefined;
+    this.turns = 0;
+    this.toolCalls = 0;
   }
 
   get running(): boolean {
@@ -210,7 +213,7 @@ export class BudgetTracker {
   }
 
   private elapsedMs(now: number): number {
-    return this.runStartedAt === undefined ? this.frozenElapsedMs : Math.max(0, now - this.runStartedAt);
+    return this.runStartedAt === undefined ? 0 : Math.max(0, now - this.runStartedAt);
   }
 
   private statusOf(used: number, max: number): LimitStatus {

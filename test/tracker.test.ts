@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { formatCount, formatLimit, formatMinutes, formatUsd } from "../src/format.js";
-import { BudgetTracker, emptyTotals } from "../src/tracker.js";
+import { BudgetTracker, countsAsTurn, emptyTotals } from "../src/tracker.js";
 import type { BudgetConfig } from "../src/types.js";
 import { usage } from "./helpers/entries.js";
 
@@ -75,13 +75,29 @@ describe("BudgetTracker scopes", () => {
     expect(t.used("minutes")).toBeCloseTo(2);
     t.endRun();
     now = 600_000;
-    expect(t.used("minutes")).toBeCloseTo(2); // frozen after endRun
+    expect(t.used("turns")).toBe(0); // idle trackers do not report run counters
+    expect(t.used("toolCalls")).toBe(0);
+    expect(t.used("minutes")).toBe(0);
 
     t.startRun();
     expect(t.used("turns")).toBe(0);
     expect(t.used("toolCalls")).toBe(0);
     expect(t.used("minutes")).toBe(0);
     expect(t.used("usd")).toBe(2);
+  });
+
+  it("does not report an exceeded run limit set while idle after a run", () => {
+    const t = new BudgetTracker(cfg({ limits: { turns: 5, toolCalls: 5 } }));
+    t.startRun();
+    for (let i = 0; i < 3; i++) {
+      t.recordTurn();
+      t.recordToolCall();
+    }
+    t.endRun();
+    expect(t.setLimit("turns", 1)).toEqual([]);
+    expect(t.setLimit("toolCalls", 2)).toEqual([]);
+    expect(t.isExceeded()).toBe(false);
+    expect(t.state().map((s) => s.status)).toEqual(["ok", "ok"]);
   });
 
   it("re-reports run-scoped crossings in a new run but not session-scoped ones", () => {
@@ -180,5 +196,16 @@ describe("formatting", () => {
     const t = new BudgetTracker(cfg({ limits: { usd: 1, turns: 5 } }));
     t.addUsage(usage({ cost: 1.2 }));
     expect(t.format()).toBe("$1.20/$1.00! · 0/5 turns");
+  });
+});
+
+describe("countsAsTurn", () => {
+  it("does not count aborted or errored turns", () => {
+    expect(countsAsTurn({ stopReason: "stop" })).toBe(true);
+    expect(countsAsTurn({ stopReason: "toolUse" })).toBe(true);
+    expect(countsAsTurn({})).toBe(true);
+    expect(countsAsTurn(undefined)).toBe(true);
+    expect(countsAsTurn({ stopReason: "aborted" })).toBe(false);
+    expect(countsAsTurn({ stopReason: "error" })).toBe(false);
   });
 });

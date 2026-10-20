@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { type FauxProviderRegistration, fauxAssistantMessage, fauxText, fauxToolCall, registerFauxProvider } from "@earendil-works/pi-ai/compat";
 import {
   createAgentSession,
+  type ExtensionAPI,
   DefaultResourceLoader,
   ModelRuntime,
   SessionManager,
@@ -40,6 +41,7 @@ interface Run {
 async function runSession(
   responses: Parameters<FauxProviderRegistration["setResponses"]>[0],
   prompts = 1,
+  extraExtensions: ((pi: ExtensionAPI) => void)[] = [],
 ): Promise<Run> {
   faux = registerFauxProvider();
   const model = faux.getModel();
@@ -77,7 +79,7 @@ async function runSession(
     noPromptTemplates: true,
     noThemes: true,
     noContextFiles: true,
-    extensionFactories: [budget],
+    extensionFactories: [budget, ...extraExtensions],
   });
   await resourceLoader.reload();
 
@@ -128,7 +130,8 @@ describe("real Pi session with the faux provider", () => {
     expect(audit).toHaveLength(1);
     expect(audit[0].data).toMatchObject({ limit: "turns", used: 2, max: 2 });
     expect(run.notifications.some((n) => n.level === "error" && /turns limit/.test(n.message))).toBe(true);
-    expect(run.statuses.at(-1)).toBe("2/2 turns!");
+    expect(run.statuses).toContain("2/2 turns!");
+    expect(run.statuses.at(-1)).toBe("0/2 turns"); // run counters are cleared once the run settles
   });
 
   it("stops on a session token limit", async () => {
@@ -165,5 +168,32 @@ describe("real Pi session with the faux provider", () => {
     const run = await runSession([fauxAssistantMessage(fauxText("a")), fauxAssistantMessage(fauxText("b"))], 2);
     expect(run.callCount).toBe(2);
     expect(run.notifications.filter((n) => n.level === "error")).toEqual([]);
+  });
+
+  it("keeps counting turns across continuations inside one run and triggers the cap", async () => {
+    vi.stubEnv("PI_BUDGET_TURNS", "3");
+    let continuations = 0;
+    // Each pass of agent_before_settle makes Pi continue the same run, which emits agent_start again.
+    const continueTwice = (pi: ExtensionAPI) => {
+      pi.on("agent_before_settle", () => {
+        if (continuations >= 3) return undefined;
+        continuations++;
+        return { continue: true, entries: [{ type: "custom_message", customType: "more", content: "continue", display: false }] };
+      });
+    };
+    const run = await runSession(
+      [
+        fauxAssistantMessage(fauxText("a")),
+        fauxAssistantMessage(fauxText("b")),
+        fauxAssistantMessage(fauxText("c")),
+        fauxAssistantMessage(fauxText("d")),
+      ],
+      1,
+      [continueTwice],
+    );
+    expect(run.callCount).toBe(3);
+    const audit = run.entries.filter((e) => e.type === "custom" && e.customType === "pi-budget");
+    expect(audit).toHaveLength(1);
+    expect(audit[0].data).toMatchObject({ limit: "turns", used: 3, max: 3 });
   });
 });

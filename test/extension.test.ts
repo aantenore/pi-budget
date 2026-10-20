@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -26,6 +26,11 @@ afterEach(() => {
   vi.restoreAllMocks();
   rmSync(root, { recursive: true, force: true });
 });
+
+const writeBudget = (dir: string, value: unknown) => {
+  mkdirSync(join(dir, ".pi"), { recursive: true });
+  writeFileSync(join(dir, ".pi", "budget.json"), typeof value === "string" ? value : JSON.stringify(value));
+};
 
 const make = (options: HarnessOptions = {}): Harness => createHarness({ cwd: project, ...options });
 
@@ -213,6 +218,99 @@ describe("per-run limits", () => {
   });
 });
 
+describe("agent_start continuations inside one run", () => {
+  it("keeps run counters and exceed memory across repeated agent_start events until agent_settled", async () => {
+    const h = make({ flags: { "budget-turns": "3", "budget-tool-calls": "2" } });
+    await h.emit("session_start", { reason: "startup" });
+    await h.emit("agent_start");
+    await turn(h, 0);
+    expect(await h.emit("tool_call", { toolName: "read", toolCallId: "1", input: {} })).toBeUndefined();
+
+    await h.emit("agent_start"); // auto-retry / queued message / agent_before_settle continuation
+    expect(h.lastStatus()).toBe("1/3 turns · 1/2 tools");
+    await turn(h, 0);
+    await h.emit("agent_start");
+    expect(h.abort).not.toHaveBeenCalled();
+    await turn(h, 0); // third turn of the same run
+    expect(h.abort).toHaveBeenCalledTimes(1);
+    expect(h.appended.map((a) => a.data.limit)).toEqual(["turns"]);
+
+    await h.emit("agent_start"); // a further continuation neither re-aborts nor re-audits
+    expect(h.abort).toHaveBeenCalledTimes(1);
+    expect(h.appended).toHaveLength(1);
+    expect(h.lastStatus()).toBe("3/3 turns! · 1/2 tools");
+
+    await h.emit("agent_settled", { aborted: true });
+    await h.emit("agent_start"); // a new prompt starts a fresh run
+    expect(h.lastStatus()).toBe("0/3 turns · 0/2 tools");
+  });
+
+  it("arms the timer and checks exhaustion only on the first agent_start", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-01-01T00:00:00Z"));
+    const h = make({ flags: { "budget-minutes": "10" } });
+    await h.emit("session_start", { reason: "startup" });
+    await h.emit("agent_start");
+    await vi.advanceTimersByTimeAsync(5 * 60_000);
+    await h.emit("agent_start"); // continuation: must not restart the wall clock
+    expect(vi.getTimerCount()).toBe(1);
+    await vi.advanceTimersByTimeAsync(5 * 60_000 + 1_000); // 10m01s after the first start
+    expect(h.abort).toHaveBeenCalledTimes(1);
+    expect(levels(h, "error")[0]!.message).toMatch(/reached minutes limit/);
+  });
+
+  it("starts a new run after session_start and session_shutdown", async () => {
+    const h = make({ flags: { "budget-turns": "5" } });
+    await h.emit("session_start", { reason: "startup" });
+    await h.emit("agent_start");
+    await turn(h, 0);
+    await h.emit("session_shutdown", { reason: "quit" });
+    await h.emit("agent_start");
+    expect(h.lastStatus()).toBe("0/5 turns");
+    await turn(h, 0);
+    await h.emit("session_start", { reason: "reload" });
+    await h.emit("agent_start");
+    expect(h.lastStatus()).toBe("0/5 turns");
+  });
+});
+
+describe("tool_call freshness", () => {
+  it("refreshes session totals before the check, replacing rather than adding", async () => {
+    const h = make({ flags: { "budget-usd": "1" } });
+    await h.emit("session_start", { reason: "startup" });
+    await h.emit("agent_start");
+    h.entries.push(assistantEntry(usage({ cost: 0.6 })));
+    expect(await h.emit("tool_call", { toolName: "bash", toolCallId: "1", input: {} })).toBeUndefined();
+    expect(h.lastStatus()).toBe("$0.60/$1.00");
+    expect(await h.emit("tool_call", { toolName: "bash", toolCallId: "2", input: {} })).toBeUndefined();
+    expect(h.lastStatus()).toBe("$0.60/$1.00"); // not double counted
+
+    h.entries.push(assistantEntry(usage({ cost: 0.6 }))); // current turn's usage, no turn_end yet
+    const blocked = await h.emit("tool_call", { toolName: "bash", toolCallId: "3", input: {} });
+    expect(blocked).toMatchObject({ block: true, terminate: true });
+    expect(blocked.reason).toMatch(/usd \$1\.20\/\$1\.00/);
+    expect(h.appended).toHaveLength(1);
+    await turn(h, 0); // the later turn_end neither re-audits nor re-aborts more than once
+    expect(h.appended).toHaveLength(1);
+    expect(h.abort).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("failed turns", () => {
+  it("does not count aborted or errored turns", async () => {
+    const h = make({ flags: { "budget-turns": "2" } });
+    await h.emit("session_start", { reason: "startup" });
+    await h.emit("agent_start");
+    await turn(h, 0, { message: { stopReason: "error" } });
+    await turn(h, 0, { message: { stopReason: "aborted" } });
+    expect(h.lastStatus()).toBe("0/2 turns");
+    await turn(h, 0, { message: { stopReason: "toolUse" } });
+    await turn(h, 0, { message: { stopReason: "stop" } });
+    expect(h.lastStatus()).toBe("2/2 turns!");
+    expect(h.abort).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe("wall time", () => {
   it("starts on agent_start, warns, aborts at the limit and clears on agent_settled", async () => {
     vi.useFakeTimers();
@@ -343,6 +441,27 @@ describe("/budget command", () => {
     expect(h.abort).toHaveBeenCalledTimes(2);
   });
 
+  it("does not report an exceed or audit when a run limit is set while idle", async () => {
+    const h = make({ flags: { "budget-turns": "5", "budget-tool-calls": "5" } });
+    await h.emit("session_start", { reason: "startup" });
+    await h.emit("agent_start");
+    await turn(h, 0);
+    await turn(h, 0);
+    await h.emit("tool_call", { toolName: "read", toolCallId: "1", input: {} });
+    await h.emit("agent_settled", { aborted: false });
+
+    await h.command("set turns 1");
+    await h.command("set tool-calls 1");
+    expect(h.appended).toEqual([]);
+    expect(h.abort).not.toHaveBeenCalled();
+    expect(levels(h, "error")).toEqual([]);
+    await h.command("");
+    const text = h.notifications.at(-1)!.message;
+    expect(text).not.toContain("EXCEEDED");
+    expect(text).toMatch(/turns\s+0\/1 turns/);
+    expect(h.lastStatus()).toBe("0/1 turns · 0/1 tools");
+  });
+
   it("rejects bad input without changing limits", async () => {
     const h = make({ flags: { "budget-usd": "1" } });
     await h.emit("session_start", { reason: "startup" });
@@ -350,6 +469,8 @@ describe("/budget command", () => {
     expect(h.notifications.at(-1)).toMatchObject({ level: "error" });
     await h.command("set nonsense 3");
     expect(h.notifications.at(-1)!.message).toMatch(/Unknown limit/);
+    await h.command("set constructor 3");
+    expect(h.notifications.at(-1)!.message).toMatch(/Unknown limit "constructor"/);
     await h.command("bogus");
     expect(h.notifications.at(-1)!.message).toMatch(/Usage:/);
     expect(h.lastStatus()).toBe("$0.00/$1.00");
@@ -357,15 +478,69 @@ describe("/budget command", () => {
 });
 
 describe("failure handling", () => {
-  it("reports an invalid configuration and disables enforcement", async () => {
-    const h = make({ flags: { "budget-usd": "-1" } });
+  it("ignores only the invalid setting, reports it and keeps enforcing the rest", async () => {
+    const h = make({ flags: { "budget-usd": "-1", "budget-turns": "1" } });
     await h.emit("session_start", { reason: "startup" });
     expect(levels(h, "error")).toHaveLength(1);
-    expect(levels(h, "error")[0]!.message).toMatch(/--budget-usd.*disabled/);
+    expect(levels(h, "error")[0]!.message).toMatch(/--budget-usd.*ignored/s);
+    expect(h.lastStatus()).toBe("0/1 turns");
     await h.emit("agent_start");
     await turn(h, 100);
+    expect(h.abort).toHaveBeenCalledTimes(1); // the valid turns limit is still enforced
+    expect(h.appended[0]!.data).toMatchObject({ limit: "turns" });
+  });
+
+  it("keeps a valid user file when the environment is invalid", async () => {
+    writeBudget(root, { limits: { turns: 1 } });
+    vi.stubEnv("PI_BUDGET_USD", "abc");
+    const h = make();
+    await h.emit("session_start", { reason: "startup" });
+    expect(levels(h, "error")[0]!.message).toMatch(/PI_BUDGET_USD/);
+    expect(h.lastStatus()).toBe("0/1 turns");
+  });
+
+  it("blocks runs and tool calls when a config file cannot be loaded in stop mode", async () => {
+    writeBudget(root, "{not json");
+    const h = make({ flags: { "budget-usd": "5" } });
+    await h.emit("session_start", { reason: "startup" });
+    expect(levels(h, "error")[0]!.message).toMatch(/invalid JSON.*Blocking runs and tool calls/s);
+    expect(h.lastStatus()).toBe("$0.00/$5.00"); // valid layers still apply
+
+    await h.emit("agent_start");
+    expect(h.abort).toHaveBeenCalledTimes(1);
+    expect(levels(h, "error").at(-1)!.message).toMatch(/could not be loaded/);
+    const blocked = await h.emit("tool_call", { toolName: "bash", toolCallId: "1", input: {} });
+    expect(blocked).toMatchObject({ block: true, terminate: true });
+    expect(blocked.reason).toMatch(/could not be loaded/);
+    await h.command("");
+    expect(h.notifications.at(-1)!.message).toMatch(/BLOCKED/);
+
+    // Fixing the file and reloading the session lifts the block.
+    writeBudget(root, { limits: { turns: 3 } });
+    await h.emit("agent_settled", { aborted: true });
+    await h.emit("session_start", { reason: "reload" });
+    await h.emit("agent_start");
+    expect(h.abort).toHaveBeenCalledTimes(1);
+    expect(await h.emit("tool_call", { toolName: "bash", toolCallId: "2", input: {} })).toBeUndefined();
+  });
+
+  it("does not block on an unreadable config when warn mode is chosen explicitly", async () => {
+    writeBudget(root, "{not json");
+    const h = make({ flags: { "budget-on-exceed": "warn" } });
+    await h.emit("session_start", { reason: "startup" });
+    expect(levels(h, "error")).toHaveLength(1);
+    await h.emit("agent_start");
     expect(h.abort).not.toHaveBeenCalled();
     expect(await h.emit("tool_call", { toolName: "bash", toolCallId: "1", input: {} })).toBeUndefined();
+  });
+
+  it("applies the project file only as a tightening", async () => {
+    writeBudget(root, { limits: { turns: 5 }, onExceed: "stop" });
+    writeBudget(project, { limits: { turns: 50, toolCalls: 2 }, onExceed: "warn" });
+    const h = make();
+    await h.emit("session_start", { reason: "startup" });
+    expect(h.lastStatus()).toBe("0/5 turns · 0/2 tools");
+    expect(levels(h, "error")).toEqual([]);
   });
 
   it("catches handler errors and reports each distinct error once", async () => {
@@ -379,7 +554,26 @@ describe("failure handling", () => {
     await expect(h.emit("turn_end", { turnIndex: 1, message: {}, toolResults: [] })).resolves.toBeUndefined();
     const errors = levels(h, "error").filter((n) => /internal error in turn_end: boom/.test(n.message));
     expect(errors).toHaveLength(1);
-    // The host keeps working: tools are not blocked after a failed accounting step.
-    expect(await h.emit("tool_call", { toolName: "bash", toolCallId: "1", input: {} })).toBeUndefined();
+  });
+
+  it("blocks tool calls when the handler throws in stop mode, and allows them in warn mode", async () => {
+    const h = make({ flags: { "budget-usd": "1" } });
+    await h.emit("session_start", { reason: "startup" });
+    await h.emit("agent_start");
+    h.ctx.sessionManager.getEntries = () => {
+      throw new Error("boom");
+    };
+    const blocked = await h.emit("tool_call", { toolName: "bash", toolCallId: "1", input: {} });
+    expect(blocked).toMatchObject({ block: true, terminate: true });
+    expect(blocked.reason).toMatch(/could not verify the budget/);
+    expect(levels(h, "error").some((n) => /internal error in tool_call: boom/.test(n.message))).toBe(true);
+
+    const w = make({ flags: { "budget-usd": "1", "budget-on-exceed": "warn" } });
+    await w.emit("session_start", { reason: "startup" });
+    await w.emit("agent_start");
+    w.ctx.sessionManager.getEntries = () => {
+      throw new Error("boom");
+    };
+    expect(await w.emit("tool_call", { toolName: "bash", toolCallId: "1", input: {} })).toBeUndefined();
   });
 });

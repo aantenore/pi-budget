@@ -1,10 +1,10 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { DEFAULT_CONFIG, FLAG_NAMES, type FlagValues, loadConfig } from "../src/config.js";
+import { type ConfigReport, DEFAULT_CONFIG, FLAG_NAMES, type FlagValues, loadConfigReport } from "../src/config.js";
 import { totalsFromEntries } from "../src/entries.js";
 import { formatLimit, formatMax } from "../src/format.js";
 import { kebabName, LIMIT_SCOPE, parseLimitValue, resolveLimitKey } from "../src/limits.js";
 import { describeCrossing, exceededReason } from "../src/messages.js";
-import { BudgetTracker } from "../src/tracker.js";
+import { BudgetTracker, countsAsTurn } from "../src/tracker.js";
 import type { Crossing } from "../src/types.js";
 
 const STATUS_KEY = "budget";
@@ -34,6 +34,8 @@ export default function budget(pi: ExtensionAPI): void {
   let timer: ReturnType<typeof setTimeout> | undefined;
   let abortedThisRun = false;
   let unpricedNoted = false;
+  /** Set when a configuration source could not be loaded and stop mode applies: work is refused until it is fixed. */
+  let configBlock: string | undefined;
   const reported = new Set<string>();
 
   function say(ctx: ExtensionContext, message: string, level: "info" | "warning" | "error"): void {
@@ -55,14 +57,14 @@ export default function budget(pi: ExtensionAPI): void {
     }
   }
 
-  function guard<E, R>(where: string, fn: (event: E, ctx: ExtensionContext) => R) {
+  function guard<E, R>(where: string, fn: (event: E, ctx: ExtensionContext) => R, onError?: () => R | undefined) {
     return (event: E, ctx: ExtensionContext): R | undefined => {
       latestCtx = ctx;
       try {
         return fn(event, ctx);
       } catch (error) {
         reportOnce(where, error);
-        return undefined;
+        return onError?.();
       }
     };
   }
@@ -147,13 +149,22 @@ export default function budget(pi: ExtensionAPI): void {
       clearTimer();
       abortedThisRun = false;
       unpricedNoted = false;
+      configBlock = undefined;
+      let report: ConfigReport;
       try {
-        tracker = new BudgetTracker(loadConfig({ cwd: ctx.cwd, flags: readFlags() }));
+        report = loadConfigReport({ cwd: ctx.cwd, flags: readFlags() });
       } catch (error) {
-        tracker = new BudgetTracker(DEFAULT_CONFIG);
-        say(ctx, `${(error as Error).message}. Budget enforcement is disabled until this is fixed.`, "error");
-        updateStatus(ctx);
-        return;
+        report = { config: DEFAULT_CONFIG, problems: [(error as Error).message], unusable: true };
+      }
+      tracker = new BudgetTracker(report.config);
+      if (report.problems.length > 0) {
+        const detail = report.problems.map((p) => `pi-budget: ${p}`).join("\n");
+        if (report.unusable && report.config.onExceed === "stop") {
+          configBlock = `The budget configuration could not be loaded (${report.problems.join("; ")}). Fix it and reload.`;
+          say(ctx, `${detail}\nBlocking runs and tool calls until this is fixed.`, "error");
+        } else {
+          say(ctx, `${detail}\nThe invalid settings were ignored; the rest of the configuration applies.`, "error");
+        }
       }
       const crossings = tracker.loadSession(totalsFromEntries(ctx.sessionManager.getEntries()));
       handleCrossings(ctx, crossings, false);
@@ -164,10 +175,17 @@ export default function budget(pi: ExtensionAPI): void {
   pi.on(
     "agent_start",
     guard("agent_start", (_event, ctx) => {
+      // Pi emits agent_start again for every continuation inside one run (auto-retry, compaction,
+      // queued messages, agent_before_settle); only the first start begins a run.
+      if (tracker.running) return;
       abortedThisRun = false;
       handleCrossings(ctx, tracker.startRun());
       armTimer();
-      if (tracker.mode === "stop" && tracker.isExceeded()) {
+      if (configBlock !== undefined) {
+        say(ctx, configBlock, "error");
+        abortedThisRun = true;
+        ctx.abort();
+      } else if (tracker.mode === "stop" && tracker.isExceeded()) {
         say(
           ctx,
           `Budget already exhausted (${tracker.format()}). Raise it with /budget set <limit> <value>.`,
@@ -181,10 +199,11 @@ export default function budget(pi: ExtensionAPI): void {
 
   pi.on(
     "turn_end",
-    guard("turn_end", (_event, ctx) => {
+    guard("turn_end", (event: { message?: unknown }, ctx) => {
       syncFromSession(ctx);
-      // Pi still dispatches a turn_end for the turn that the abort cancelled; it is not a completed turn.
-      if (!abortedThisRun) handleCrossings(ctx, tracker.recordTurn());
+      // Pi still dispatches a turn_end for the turn that the abort cancelled, and for turns that
+      // failed or were aborted; none of them is a completed turn.
+      if (!abortedThisRun && countsAsTurn(event.message)) handleCrossings(ctx, tracker.recordTurn());
       enforce(ctx);
       updateStatus(ctx);
     }),
@@ -192,15 +211,31 @@ export default function budget(pi: ExtensionAPI): void {
 
   pi.on(
     "tool_call",
-    guard("tool_call", (_event, ctx) => {
-      if (tracker.mode === "stop" && tracker.isExceeded()) {
-        return { block: true, reason: exceededReason(tracker.exceededLimits()), terminate: true };
-      }
-      // Reaching the tool-call limit with this call lets it run; the run is aborted at turn end.
-      handleCrossings(ctx, tracker.recordToolCall());
-      updateStatus(ctx);
-      return undefined;
-    }),
+    guard(
+      "tool_call",
+      (_event, ctx) => {
+        if (configBlock !== undefined) return { block: true, reason: configBlock, terminate: true };
+        // Totals are otherwise refreshed only at turn end; replace them from the entries so the
+        // current turn's usage is already known before this call runs.
+        syncFromSession(ctx);
+        if (tracker.mode === "stop" && tracker.isExceeded()) {
+          return { block: true, reason: exceededReason(tracker.exceededLimits()), terminate: true };
+        }
+        // Reaching the tool-call limit with this call lets it run; the run is aborted at turn end.
+        handleCrossings(ctx, tracker.recordToolCall());
+        updateStatus(ctx);
+        return undefined;
+      },
+      // Fail closed: when enforcement itself breaks in stop mode, do not let the tool run unchecked.
+      () =>
+        tracker.mode === "stop" && tracker.hasLimits()
+          ? {
+              block: true,
+              reason: "pi-budget could not verify the budget (internal error); tool call blocked.",
+              terminate: true,
+            }
+          : undefined,
+    ),
   );
 
   const resync = (where: string) =>
@@ -225,12 +260,13 @@ export default function budget(pi: ExtensionAPI): void {
     "session_shutdown",
     guard("session_shutdown", () => {
       clearTimer();
+      tracker.endRun();
     }),
   );
 
   function describeBudget(): string {
     const states = tracker.state();
-    const header = `Budget (on exceed: ${tracker.mode})`;
+    const header = `Budget (on exceed: ${tracker.mode})${configBlock === undefined ? "" : `\nBLOCKED: ${configBlock}`}`;
     if (states.length === 0) {
       return `${header}\nNo limits set. Use --budget-usd / --budget-turns / ..., a budget.json file, or /budget set <limit> <value>.`;
     }

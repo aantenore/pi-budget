@@ -37,7 +37,8 @@ const KEBAB: Record<string, LimitKey> = {
 export function resolveLimitKey(name: string): LimitKey | undefined {
   const trimmed = name.trim();
   if ((LIMIT_KEYS as readonly string[]).includes(trimmed)) return trimmed as LimitKey;
-  return KEBAB[trimmed.toLowerCase().replace(/_/g, "-")];
+  const kebab = trimmed.toLowerCase().replace(/_/g, "-");
+  return Object.hasOwn(KEBAB, kebab) ? KEBAB[kebab] : undefined;
 }
 
 /** Kebab-case spelling of a limit key, as used by CLI flags and the /budget command. */
@@ -45,14 +46,17 @@ export function kebabName(key: LimitKey): string {
   return key.replace(/[A-Z]/g, (c) => `-${c.toLowerCase()}`);
 }
 
+/** Plain decimal notation only: no sign, hex, octal, binary or `Infinity`. */
+const DECIMAL = /^\d+(\.\d+)?([eE][+-]?\d+)?$/;
+
 /**
- * Parse and validate a limit value. Strings (env vars, CLI flags) are converted with `Number`.
+ * Parse and validate a limit value. Strings (env vars, CLI flags) must be plain decimals.
  * Throws a plain `Error` with a human-readable message; callers add the source.
  */
 export function parseLimitValue(key: LimitKey, raw: unknown): number {
   let value: number;
   if (typeof raw === "number") value = raw;
-  else if (typeof raw === "string" && raw.trim() !== "") value = Number(raw.trim());
+  else if (typeof raw === "string" && DECIMAL.test(raw.trim())) value = Number(raw.trim());
   else throw new Error(`"${key}" must be a positive number, got ${JSON.stringify(raw)}`);
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(`"${key}" must be a positive number, got ${JSON.stringify(raw)}`);

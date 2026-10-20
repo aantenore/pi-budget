@@ -8,6 +8,7 @@ import {
   layerFromEnv,
   layerFromFlags,
   loadConfig,
+  loadConfigReport,
   normalizeConfig,
   validateLayer,
 } from "../src/config.js";
@@ -37,27 +38,24 @@ describe("loadConfig precedence", () => {
     expect(loadConfig({ homeDir: home, cwd: project, env: {} })).toEqual(DEFAULT_CONFIG);
   });
 
-  it("merges defaults < user file < project file < env < flags, key by key", () => {
+  it("merges defaults < user file < env < flags, key by key", () => {
     writeJson(home, { limits: { usd: 1, tokens: 1000, turns: 10 }, warnAt: 0.5, onExceed: "warn" });
-    writeJson(project, { limits: { usd: 2, toolCalls: 20 }, onExceed: "stop" });
     const env = { PI_BUDGET_USD: "3", PI_BUDGET_MINUTES: "15", PI_BUDGET_WARN_AT: "0.9" };
-    const flags = { usd: "4", onExceed: "warn" } as const;
+    const flags = { usd: "4", onExceed: "stop" } as const;
 
-    const config = loadConfig({ homeDir: home, cwd: project, env, flags });
+    const config = loadConfig({ homeDir: home, env, flags });
     expect(config).toEqual({
-      limits: { usd: 4, tokens: 1000, turns: 10, toolCalls: 20, minutes: 15 },
+      limits: { usd: 4, tokens: 1000, turns: 10, minutes: 15 },
       warnAt: 0.9,
-      onExceed: "warn",
+      onExceed: "stop",
     });
   });
 
-  it("applies each layer in order", () => {
+  it("applies user file, env and flags in order", () => {
     writeJson(home, { limits: { usd: 1 } });
-    expect(loadConfig({ homeDir: home, cwd: project, env: {} }).limits.usd).toBe(1);
-    writeJson(project, { limits: { usd: 2 } });
-    expect(loadConfig({ homeDir: home, cwd: project, env: {} }).limits.usd).toBe(2);
-    expect(loadConfig({ homeDir: home, cwd: project, env: { PI_BUDGET_USD: "3" } }).limits.usd).toBe(3);
-    expect(loadConfig({ homeDir: home, cwd: project, env: { PI_BUDGET_USD: "3" }, flags: { usd: "4" } }).limits.usd).toBe(4);
+    expect(loadConfig({ homeDir: home, env: {} }).limits.usd).toBe(1);
+    expect(loadConfig({ homeDir: home, env: { PI_BUDGET_USD: "3" } }).limits.usd).toBe(3);
+    expect(loadConfig({ homeDir: home, env: { PI_BUDGET_USD: "3" }, flags: { usd: "4" } }).limits.usd).toBe(4);
   });
 
   it("reads every documented env var", () => {
@@ -92,6 +90,76 @@ describe("loadConfig precedence", () => {
   it("skips the project file when no cwd is given", () => {
     writeJson(project, { limits: { usd: 2 } });
     expect(loadConfig({ homeDir: home, env: {} }).limits).toEqual({});
+  });
+});
+
+describe("untrusted project config only tightens", () => {
+  const load = (extra: Partial<Parameters<typeof loadConfig>[0]> = {}) =>
+    loadConfig({ homeDir: home, cwd: project, env: {}, ...extra });
+
+  it("takes the lower limit and may add a limit the user did not set", () => {
+    writeJson(home, { limits: { usd: 5, turns: 10 } });
+    writeJson(project, { limits: { usd: 2, turns: 50, toolCalls: 20 } });
+    expect(load().limits).toEqual({ usd: 2, turns: 10, toolCalls: 20 });
+  });
+
+  it("cannot raise a limit set by env or flags", () => {
+    writeJson(project, { limits: { usd: 100, tokens: 500 } });
+    const config = load({ env: { PI_BUDGET_USD: "3" }, flags: { tokens: "1000" } });
+    expect(config.limits).toEqual({ usd: 3, tokens: 500 });
+  });
+
+  it("can switch warn to stop but never stop to warn", () => {
+    writeJson(home, { onExceed: "warn" });
+    writeJson(project, { onExceed: "stop" });
+    expect(load().onExceed).toBe("stop");
+    writeJson(home, { onExceed: "stop" });
+    writeJson(project, { onExceed: "warn" });
+    expect(load().onExceed).toBe("stop");
+    expect(load({ flags: { onExceed: "stop" } }).onExceed).toBe("stop");
+    rmSync(join(home, ".pi"), { recursive: true });
+    expect(load().onExceed).toBe("stop"); // the default stop is not relaxed by a warn project either
+    expect(load({ flags: { onExceed: "warn" } }).onExceed).toBe("warn"); // the user's own choice still wins
+  });
+
+  it("applies warnAt from the project only when lower", () => {
+    writeJson(home, { warnAt: 0.7 });
+    writeJson(project, { warnAt: 0.9 });
+    expect(load().warnAt).toBe(0.7);
+    writeJson(project, { warnAt: 0.5 });
+    expect(load().warnAt).toBe(0.5);
+  });
+});
+
+describe("loadConfigReport keeps valid layers", () => {
+  it("drops only the invalid keys and reports them", () => {
+    writeJson(home, { limits: { usd: 2, turns: -1 }, onExceed: "warn", bogus: 1 });
+    writeJson(project, { limits: { toolCalls: 7 } });
+    const report = loadConfigReport({ homeDir: home, cwd: project, env: { PI_BUDGET_TOKENS: "abc", PI_BUDGET_MINUTES: "9" } });
+    expect(report.config).toEqual({ limits: { usd: 2, toolCalls: 7, minutes: 9 }, warnAt: 0.8, onExceed: "warn" });
+    expect(report.unusable).toBe(false);
+    expect(report.problems).toHaveLength(2);
+    expect(report.problems.join("\n")).toMatch(/unknown key "bogus".*"turns"/s);
+    expect(report.problems.join("\n")).toMatch(/PI_BUDGET_TOKENS/);
+  });
+
+  it("flags an unreadable source as unusable and keeps the other layers", () => {
+    writeJson(home, "{not json");
+    const report = loadConfigReport({ homeDir: home, env: { PI_BUDGET_USD: "2" } });
+    expect(report.unusable).toBe(true);
+    expect(report.config.limits).toEqual({ usd: 2 });
+    expect(report.config.onExceed).toBe("stop");
+    expect(report.problems[0]).toMatch(/invalid JSON in .*budget\.json/);
+    writeJson(home, []);
+    expect(loadConfigReport({ homeDir: home, env: {} }).unusable).toBe(true);
+  });
+
+  it("a bad project file is unusable but cannot loosen anything", () => {
+    writeJson(home, { limits: { usd: 2 } });
+    writeJson(project, "nope");
+    const report = loadConfigReport({ homeDir: home, cwd: project, env: {} });
+    expect(report.unusable).toBe(true);
+    expect(report.config.limits).toEqual({ usd: 2 });
   });
 });
 
@@ -163,9 +231,25 @@ describe("limit helpers", () => {
     expect(resolveLimitKey("nope")).toBeUndefined();
   });
 
+  it("does not resolve prototype keys", () => {
+    for (const name of ["constructor", "__proto__", "toString", "hasOwnProperty", "valueOf", "__PROTO__"]) {
+      expect(resolveLimitKey(name)).toBeUndefined();
+    }
+  });
+
   it("parses numeric strings", () => {
     expect(parseLimitValue("usd", " 2.5 ")).toBe(2.5);
     expect(() => parseLimitValue("usd", "")).toThrow();
     expect(() => parseLimitValue("usd", "Infinity")).toThrow();
+  });
+
+  it("accepts plain decimal strings only", () => {
+    expect(parseLimitValue("tokens", "1e3")).toBe(1000);
+    expect(parseLimitValue("minutes", "0.5")).toBe(0.5);
+    for (const bad of ["0x10", "0b11", "0o7", "0X1F", "-5", "+5", ".5", "5.", "1_000", "1 000", "1e", "NaN"]) {
+      expect(() => parseLimitValue("tokens", bad), bad).toThrow(/positive number/);
+    }
+    expect(() => validateLayer({ limits: { tokens: "0x10" } }, "x")).toThrow(/"tokens"/);
+    expect(() => layerFromEnv({ PI_BUDGET_TOKENS: "0b11" })).toThrow(/PI_BUDGET_TOKENS/);
   });
 });
