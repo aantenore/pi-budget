@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { LIMIT_KEYS, parseLimitValue } from "./limits.js";
+import { LIMIT_KEYS, isPlainDecimal, parseLimitValue } from "./limits.js";
 import type { BudgetConfig, BudgetLimits, LimitKey, OnExceed } from "./types.js";
 
 export const DEFAULT_WARN_AT = 0.8;
@@ -27,7 +27,7 @@ export class BudgetConfigError extends Error {
 }
 
 export function parseWarnAt(raw: unknown): number {
-  const value = typeof raw === "string" && raw.trim() !== "" ? Number(raw.trim()) : raw;
+  const value = typeof raw === "string" ? (isPlainDecimal(raw) ? Number(raw.trim()) : Number.NaN) : raw;
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0 || value > 1) {
     throw new Error(`"warnAt" must be a number greater than 0 and at most 1, got ${JSON.stringify(raw)}`);
   }

@@ -49,6 +49,11 @@ export function kebabName(key: LimitKey): string {
 /** Plain decimal notation only: no sign, hex, octal, binary or `Infinity`. */
 const DECIMAL = /^\d+(\.\d+)?([eE][+-]?\d+)?$/;
 
+/** True when `text` (trimmed) is a plain decimal number string. */
+export function isPlainDecimal(text: string): boolean {
+  return DECIMAL.test(text.trim());
+}
+
 /**
  * Parse and validate a limit value. Strings (env vars, CLI flags) must be plain decimals.
  * Throws a plain `Error` with a human-readable message; callers add the source.
@@ -56,7 +61,7 @@ const DECIMAL = /^\d+(\.\d+)?([eE][+-]?\d+)?$/;
 export function parseLimitValue(key: LimitKey, raw: unknown): number {
   let value: number;
   if (typeof raw === "number") value = raw;
-  else if (typeof raw === "string" && DECIMAL.test(raw.trim())) value = Number(raw.trim());
+  else if (typeof raw === "string" && isPlainDecimal(raw)) value = Number(raw.trim());
   else throw new Error(`"${key}" must be a positive number, got ${JSON.stringify(raw)}`);
   if (!Number.isFinite(value) || value <= 0) {
     throw new Error(`"${key}" must be a positive number, got ${JSON.stringify(raw)}`);

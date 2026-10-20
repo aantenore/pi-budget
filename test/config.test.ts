@@ -10,6 +10,7 @@ import {
   loadConfig,
   loadConfigReport,
   normalizeConfig,
+  parseWarnAt,
   validateLayer,
 } from "../src/config.js";
 import { parseLimitValue, resolveLimitKey } from "../src/limits.js";
@@ -251,5 +252,12 @@ describe("limit helpers", () => {
     }
     expect(() => validateLayer({ limits: { tokens: "0x10" } }, "x")).toThrow(/"tokens"/);
     expect(() => layerFromEnv({ PI_BUDGET_TOKENS: "0b11" })).toThrow(/PI_BUDGET_TOKENS/);
+  });
+
+  it("rejects non-decimal warnAt strings", () => {
+    expect(parseWarnAt("0.5")).toBe(0.5);
+    for (const bad of ["0x1", "0b1", "0o1", "+1", ".5", "1.", "", "NaN"]) {
+      expect(() => parseWarnAt(bad), bad).toThrow(/warnAt/);
+    }
   });
 });

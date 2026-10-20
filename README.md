@@ -126,6 +126,8 @@ agent.subscribe(budget.observe);         // required: resets run counters, recor
 
 `budget.tracker` exposes the current state (`tracker.format()`, `tracker.used("usd")`, `tracker.state()`). If you already define `finishTurn` or `beforeToolCall`, call the budget hook first and keep its decision when it returns one. In the SDK, `minutes` is checked at turn boundaries and before tool calls; there is no timer, so a single long provider request is not interrupted (use `onCrossing` with `agent.abort()` if you need that).
 
+Run scope: in the SDK the application decides what a run is. Each `agent.prompt()` or explicit `agent.continue()` starts a new run for the run-scoped limits (`turns`, `toolCalls`, `minutes`), while session-scoped limits (`usd`, `tokens`) accumulate across runs.
+
 The pure pieces are also exported: `BudgetTracker`, `loadConfig`, `validateLayer`, `totalsFromEntries`.
 
 ## How it works
