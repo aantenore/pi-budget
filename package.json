@@ -14,7 +14,10 @@
     "cost",
     "limits",
     "tokens",
-    "agent"
+    "agent",
+    "llm",
+    "agents",
+    "guardrails"
   ],
   "engines": {
     "node": ">=22.19"
@@ -72,5 +75,13 @@
     "@types/node": "^26.6.5",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/aantenore/pi-budget.git"
+  },
+  "homepage": "https://github.com/aantenore/pi-budget#readme",
+  "bugs": {
+    "url": "https://github.com/aantenore/pi-budget/issues"
   }
 }
