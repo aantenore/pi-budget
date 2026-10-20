@@ -1,6 +1,13 @@
-# @aantenore/pi-budget
+# pi-budget
 
-Hard limits for Pi: stop runaway agents before they burn your budget.
+**Hard limits for Pi: stop runaway agents before they burn your budget.**
+
+[![CI](https://github.com/aantenore/pi-budget/actions/workflows/ci.yml/badge.svg)](https://github.com/aantenore/pi-budget/actions/workflows/ci.yml)
+![limits](https://img.shields.io/badge/limits-USD%20·%20tokens%20·%20turns%20·%20tool%20calls%20·%20time-blue)
+![license](https://img.shields.io/badge/license-MIT-lightgrey)
+
+An agent stuck in a loop at 3 a.m. does not stop on its own. Pi has no built-in spend cap, and before this package
+none of the community packages enforced one per session.
 
 `pi-budget` is a [Pi](https://pi.dev) package that enforces spend, token, turn, tool-call and wall-time limits on the coding agent, plus a small helper for apps built on `@earendil-works/pi-agent-core`.
 
@@ -12,6 +19,25 @@ pi --budget-usd 2 --budget-turns 30
 ```
 
 Pi now stops the run when the session has spent $2, or when a single agent run reaches 30 turns. A status line shows live usage (`$0.12/$2.00 · 4/30 turns`), and `/budget` shows the details.
+
+## See it work
+
+Real runs of the Pi CLI (1.3.0) with a local `gemma4:12b` through Ollama, asked to read six files one by one:
+
+```text
+$ pi -p --budget-turns 2 "Read each of the six note files one at a time, then list all six secret words."
+[pi-budget] Budget: reached turns limit (2/2 turns). Stopping the run.
+
+$ pi -p --budget-tokens 3000 "Read each of the six note files one at a time, then list all six secret words."
+[pi-budget] Budget: reached tokens limit (3.2k/3k tok). Stopping the run.
+
+$ pi -p --budget-turns 2 --budget-on-exceed warn "Read note1.txt and note2.txt, then tell me both secret words."
+[pi-budget] Budget: reached turns limit (2/2 turns).
+The secret words are item1 and item2.
+```
+
+Every stop is also written to the session as an audit entry:
+`{"customType":"pi-budget","data":{"limit":"turns","used":2,"max":2,"at":"…"}}`.
 
 ## Limits
 
