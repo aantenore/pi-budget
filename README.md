@@ -2,6 +2,7 @@
 
 **Hard limits for Pi: stop runaway agents before they burn your budget.**
 
+[![npm](https://img.shields.io/npm/v/@aantenore/pi-budget)](https://www.npmjs.com/package/@aantenore/pi-budget)
 [![CI](https://github.com/aantenore/pi-budget/actions/workflows/ci.yml/badge.svg)](https://github.com/aantenore/pi-budget/actions/workflows/ci.yml)
 ![limits](https://img.shields.io/badge/limits-USD%20·%20tokens%20·%20turns%20·%20tool%20calls%20·%20time-blue)
 ![license](https://img.shields.io/badge/license-MIT-lightgrey)
